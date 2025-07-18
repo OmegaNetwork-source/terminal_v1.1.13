@@ -1,0 +1,30 @@
+{
+  "name": "omega-relayer-faucet",
+  "version": "1.0.0",
+  "description": "Omega Terminal Relayer and Faucet Backend",
+  "main": "relayer-faucet.js",
+  "scripts": {
+    "start": "node relayer-faucet.js"
+  },
+  "keywords": [
+    "blockchain",
+    "game",
+    "relayer",
+    "omega",
+    "ethereum"
+  ],
+  "author": "Bushido Game Team",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "ethers": "^5.7.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.0.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
