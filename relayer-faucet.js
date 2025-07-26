@@ -79,7 +79,20 @@ async function withNetworkRetry(operation, context = 'operation') {
     throw lastError;
 }
 
-// 🚀 INITIALIZE RPC WITH RETRY (FIXED)
+// 🔧 NONCE MANAGEMENT UTILITY (FIXES CRITICAL NONCE ISSUES)
+async function getFreshNonce(walletAddress = null) {
+    const address = walletAddress || relayerSigner.address;
+    try {
+        const nonce = await provider.getTransactionCount(address, 'pending');
+        console.log(`[NONCE] 🔄 Fresh nonce for ${address.slice(0,6)}...${address.slice(-4)}: ${nonce}`);
+        return nonce;
+    } catch (error) {
+        console.error(`[NONCE] ❌ Failed to get nonce for ${address}: ${error.message}`);
+        throw error;
+    }
+}
+
+// 🚀 INITIALIZE RPC WITH RETRY (FIXED + NONCE SYNC)
 async function initializeProvider() {
     const rpcUrl = RPC_ENDPOINTS[currentRpcIndex];
     console.log(`[RPC] Initializing connection to: ${rpcUrl}`);
@@ -105,6 +118,10 @@ async function initializeProvider() {
             provider = testProvider;
             const relayerWallet = new ethers.Wallet(process.env.RELAYER_PRIVATE_KEY);
             relayerSigner = relayerWallet.connect(provider);
+            
+            // 🔧 CRITICAL: Sync nonce immediately
+            const currentNonce = await provider.getTransactionCount(relayerWallet.address, 'pending');
+            console.log(`[NONCE] 🔄 Synced to blockchain nonce: ${currentNonce}`);
             
             console.log(`[RPC] ✅ Relayer address: ${relayerWallet.address}`);
             return; // Success!
@@ -158,16 +175,26 @@ for (let i = 0; i < NUM_MINER_WALLETS; i++) {
     minerWallets.push(wallet);
 }
 
-// Helper functions
+// 🔧 NONCE-FIXED: Helper function to fund miner wallets
 async function fundMinerWalletIfNeeded(wallet) {
-    const balance = await provider.getBalance(wallet.address);
-    if (balance.lt(ethers.utils.parseEther('0.0002'))) {
-        const tx = await relayerSigner.sendTransaction({
-            to: wallet.address,
-            value: ethers.utils.parseEther('0.001')
-        });
-        await tx.wait();
-        console.log(`Funded miner wallet ${wallet.address} with 0.001 OMEGA. Tx: ${tx.hash}`);
+    try {
+        const balance = await provider.getBalance(wallet.address);
+        if (balance.lt(ethers.utils.parseEther('0.0002'))) {
+            // 🔧 CRITICAL: Get fresh nonce for funding
+            const nonce = await getFreshNonce();
+            
+            const tx = await relayerSigner.sendTransaction({
+                to: wallet.address,
+                value: ethers.utils.parseEther('0.001'),
+                gasLimit: 21000,
+                gasPrice: ethers.utils.parseUnits('20', 'gwei'),
+                nonce: nonce  // Force fresh nonce
+            });
+            await tx.wait();
+            console.log(`Funded miner wallet ${wallet.address} with 0.001 OMEGA. Tx: ${tx.hash}`);
+        }
+    } catch (error) {
+        console.error(`Failed to fund miner wallet ${wallet.address}:`, error.message);
     }
 }
 
@@ -178,7 +205,7 @@ function normAddress(address) {
 // Track rewards per user address
 const rewardsByAddress = {};
 
-// 🛡️ NETWORK-RESILIENT /fund ENDPOINT
+// 🛡️ NETWORK-RESILIENT /fund ENDPOINT (NONCE-FIXED)
 app.post('/fund', async (req, res) => {
     const { address, amount } = req.body;
     if (!address || !ethers.utils.isAddress(address)) {
@@ -192,6 +219,9 @@ app.post('/fund', async (req, res) => {
         console.log(`[FUND] 🚀 Starting: ${address} - ${ethers.utils.formatEther(fundAmount)} OMEGA`);
         
         const result = await withNetworkRetry(async () => {
+            // 🔧 CRITICAL: Get fresh nonce every time
+            const nonce = await getFreshNonce();
+            
             // Get gas price with retry
             const gasPrice = await withNetworkRetry(async () => {
                 try {
@@ -203,12 +233,13 @@ app.post('/fund', async (req, res) => {
                 }
             }, 'Gas Price Fetch');
             
-            // Send transaction
+            // Send transaction with explicit nonce
             const tx = await relayerSigner.sendTransaction({
                 to: address,
                 value: fundAmount,
                 gasLimit: 21000,
-                gasPrice: gasPrice
+                gasPrice: gasPrice,
+                nonce: nonce  // Force fresh nonce
             });
             
             return tx;
@@ -261,7 +292,8 @@ app.get('/status', async (req, res) => {
             ...result,
             timestamp: new Date().toISOString(),
             uptime: process.uptime(),
-            networkRetryEnabled: true
+            networkRetryEnabled: true,
+            nonceManagement: 'Fresh nonces per transaction'
         });
         
     } catch (error) {
@@ -544,7 +576,7 @@ app.get('/stock/gdp', async (req, res) => {
   }
 });
 
-// 🛡️ NETWORK-RESILIENT /mine ENDPOINT
+// 🛡️ NETWORK-RESILIENT /mine ENDPOINT (NONCE-FIXED)
 app.post('/mine', async (req, res) => {
     try {
         const { address } = req.body;
@@ -573,19 +605,26 @@ app.post('/mine', async (req, res) => {
             await fundMinerWalletIfNeeded(wallet);
             const contract = new ethers.Contract(MINING_CONTRACT_ADDRESS, MINING_CONTRACT_ABI, walletSigner);
             
+            // 🔧 CRITICAL: Get fresh nonce for miner wallet
+            const nonce = await getFreshNonce(wallet.address);
+            console.log(`[MINE] 🔄 Using fresh nonce for miner ${wallet.address.slice(0,6)}...${wallet.address.slice(-4)}: ${nonce}`);
+            
             // Generate random nonce and solution
-            const nonce = Math.floor(Math.random() * 1e12);
+            const miningNonce = Math.floor(Math.random() * 1e12);
             const chars = '0123456789abcdef';
             let solution = '0x';
             for (let i = 0; i < 64; i++) {
                 solution += chars[Math.floor(Math.random() * chars.length)];
             }
             
-            const tx = await contract.mineBlock(nonce, solution, { gasLimit: 200000 });
+            const tx = await contract.mineBlock(miningNonce, solution, { 
+                gasLimit: 200000,
+                nonce: nonce  // Force fresh nonce
+            });
             pendingTxs[wallet.address] = tx.hash;
             busyWallets[wallet.address] = Date.now() + 30000; // 30 seconds busy
             
-            return { tx, nonce, solution, wallet: wallet.address };
+            return { tx, nonce: miningNonce, solution, wallet: wallet.address };
         }, 'Mining Transaction');
         
         let reward = 0;
@@ -621,7 +660,7 @@ app.post('/mine', async (req, res) => {
     }
 });
 
-// Claim endpoint
+// 🛡️ NETWORK-RESILIENT /claim ENDPOINT (NONCE-FIXED)
 app.post('/claim', async (req, res) => {
     try {
         const { address } = req.body;
@@ -636,9 +675,15 @@ app.post('/claim', async (req, res) => {
         }
         
         const result = await withNetworkRetry(async () => {
+            // 🔧 CRITICAL: Get fresh nonce for claim transaction
+            const nonce = await getFreshNonce();
+            
             const tx = await relayerSigner.sendTransaction({
                 to: address,
-                value: ethers.utils.parseEther(reward.toString())
+                value: ethers.utils.parseEther(reward.toString()),
+                gasLimit: 21000,
+                gasPrice: ethers.utils.parseUnits('20', 'gwei'),
+                nonce: nonce  // Force fresh nonce
             });
             await tx.wait();
             return tx;
@@ -651,7 +696,7 @@ app.post('/claim', async (req, res) => {
     }
 });
 
-// Claimable endpoint
+// Claimable endpoint (no blockchain transaction, no nonce needed)
 app.post('/claimable', async (req, res) => {
     try {
         const { address } = req.body;
@@ -671,7 +716,7 @@ app.post('/claimable', async (req, res) => {
     }
 });
 
-// Stress test endpoint
+// 🛡️ NETWORK-RESILIENT /stress ENDPOINT (NONCE-FIXED)
 app.post('/stress', async (req, res) => {
     try {
         let txHashes = [];
@@ -680,10 +725,15 @@ app.post('/stress', async (req, res) => {
             const to = ethers.Wallet.createRandom().address;
             promises.push(
                 withNetworkRetry(async () => {
+                    // 🔧 CRITICAL: Get fresh nonce for each stress test transaction
+                    const nonce = await getFreshNonce();
+                    
                     return await relayerSigner.sendTransaction({
                         to,
                         value: 0,
-                        gasLimit: 21000
+                        gasLimit: 21000,
+                        gasPrice: ethers.utils.parseUnits('20', 'gwei'),
+                        nonce: nonce
                     });
                 }, `Stress Test ${i+1}`).then(tx => {
                     txHashes.push(tx.hash);
@@ -798,10 +848,25 @@ app.get('/jupiter/search', async (req, res) => {
   }
 });
 
+// Health check endpoint
+app.get('/', (req, res) => {
+    res.json({ 
+        status: 'OMEGA Relayer Online - Complete Version',
+        timestamp: new Date().toISOString(),
+        networkRetry: 'Enabled',
+        nonceManagement: 'Fresh nonces per transaction',
+        endpoints: {
+            blockchain: ['/fund', '/mine', '/claim', '/claimable', '/stress', '/status'],
+            apis: ['/ai', '/dex/*', '/gecko/*', '/stock/*', '/jupiter/*']
+        }
+    });
+});
+
 // Initialize and start server (RESILIENT STARTUP)
 async function startServer() {
-    console.log('🚀 INITIALIZING NETWORK-RESILIENT RELAYER...');
+    console.log('🚀 INITIALIZING NETWORK-RESILIENT RELAYER (COMPLETE VERSION)...');
     console.log('🔧 Network retry enabled for ETIMEDOUT/ENETUNREACH errors');
+    console.log('🔧 Fresh nonce management enabled for all blockchain transactions');
     
     if (!process.env.RELAYER_PRIVATE_KEY) {
         console.error('❌ CRITICAL: RELAYER_PRIVATE_KEY not found in environment variables');
@@ -818,9 +883,11 @@ async function startServer() {
     // Initialize RPC in background
     try {
         await initializeProvider();
-        console.log(`✅ RELAYER FULLY OPERATIONAL`);
+        console.log(`✅ RELAYER FULLY OPERATIONAL (COMPLETE VERSION)`);
         console.log(`🏠 Relayer address: ${relayerSigner.address}`);
         console.log(`🌐 RPC: ${RPC_ENDPOINTS[currentRpcIndex]}`);
+        console.log(`🔧 Nonce management: FIXED - Fresh nonces per transaction`);
+        console.log(`📡 API Endpoints: Gemini AI, DexScreener, GeckoTerminal, Alpha Vantage, Jupiter`);
     } catch (error) {
         console.error('⚠️  RPC initialization failed, but server is running:', error.message);
         console.error('🔄 Endpoints will retry connections automatically when called');
@@ -833,10 +900,13 @@ async function startServer() {
                 console.log('✅ RPC connection recovered!');
             } catch (retryError) {
                 console.log('❌ RPC retry failed, will try again in 60s');
-                // Could set up another retry here
             }
         }, 30000); // Retry after 30 seconds
     }
 }
 
-startServer(); 
+// Start the server
+startServer().catch(error => {
+    console.error('❌ CRITICAL: Server startup failed:', error);
+    process.exit(1);
+}); 
