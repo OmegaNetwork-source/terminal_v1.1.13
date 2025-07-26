@@ -9,20 +9,105 @@ const PORT = process.env.PORT || 4000;
 app.use(cors());
 app.use(express.json());
 
-const RPC_URL = "https://0x4e454228.rpc.aurora-cloud.dev"; // Omega RPC
-const relayerWallet = new ethers.Wallet(process.env.RELAYER_PRIVATE_KEY);
-const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
-const relayerSigner = relayerWallet.connect(provider);
+// 🔧 NETWORK RETRY CONFIGURATION (Fixes ETIMEDOUT/ENETUNREACH errors)
+const NETWORK_RETRY_CONFIG = {
+    maxRetries: 5,
+    baseDelay: 1000,  // 1 second
+    maxDelay: 10000,  // 10 seconds
+    timeoutMs: 30000  // 30 seconds per attempt
+};
 
+// 🌐 RPC ENDPOINTS (Only the one you actually have)
+const RPC_ENDPOINTS = [
+    "https://0x4e454228.rpc.aurora-cloud.dev"
+];
+
+let currentRpcIndex = 0;
+let provider = null;
+let relayerSigner = null;
+
+// 🔄 NETWORK RETRY WRAPPER (Handles your specific errors)
+async function withNetworkRetry(operation, context = 'operation') {
+    let lastError;
+    
+    for (let attempt = 1; attempt <= NETWORK_RETRY_CONFIG.maxRetries; attempt++) {
+        try {
+            console.log(`[NETWORK] ${context} - Attempt ${attempt}/${NETWORK_RETRY_CONFIG.maxRetries}`);
+            
+            // Set timeout for this attempt
+            const timeoutPromise = new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('Network timeout')), NETWORK_RETRY_CONFIG.timeoutMs)
+            );
+            
+            const result = await Promise.race([operation(), timeoutPromise]);
+            
+            console.log(`[NETWORK] ${context} - Success on attempt ${attempt}`);
+            return result;
+            
+        } catch (error) {
+            lastError = error;
+            const isNetworkError = 
+                error.code === 'ETIMEDOUT' || 
+                error.code === 'ENETUNREACH' ||
+                error.code === 'ECONNREFUSED' ||
+                error.code === 'ENOTFOUND' ||
+                error.message.includes('timeout') ||
+                error.message.includes('network') ||
+                error.message.includes('connect');
+            
+            console.log(`[NETWORK] ${context} - Attempt ${attempt} failed: ${error.message}`);
+            
+            if (!isNetworkError && attempt === 1) {
+                // Non-network error, fail fast
+                throw error;
+            }
+            
+            if (attempt < NETWORK_RETRY_CONFIG.maxRetries) {
+                // Exponential backoff with jitter
+                const delay = Math.min(
+                    NETWORK_RETRY_CONFIG.baseDelay * Math.pow(2, attempt - 1),
+                    NETWORK_RETRY_CONFIG.maxDelay
+                ) + Math.random() * 1000;
+                
+                console.log(`[NETWORK] ${context} - Retrying in ${Math.round(delay)}ms...`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+            }
+        }
+    }
+    
+    console.error(`[NETWORK] ${context} - All ${NETWORK_RETRY_CONFIG.maxRetries} attempts failed`);
+    throw lastError;
+}
+
+// 🚀 INITIALIZE RPC WITH RETRY
+async function initializeProvider() {
+    const rpcUrl = RPC_ENDPOINTS[currentRpcIndex];
+    console.log(`[RPC] Initializing connection to: ${rpcUrl}`);
+    
+    await withNetworkRetry(async () => {
+        const testProvider = new ethers.providers.JsonRpcProvider(rpcUrl);
+        
+        // Test connection
+        const blockNumber = await testProvider.getBlockNumber();
+        console.log(`[RPC] ✅ Connected - Block: ${blockNumber}`);
+        
+        provider = testProvider;
+        const relayerWallet = new ethers.Wallet(process.env.RELAYER_PRIVATE_KEY);
+        relayerSigner = relayerWallet.connect(provider);
+        
+        console.log(`[RPC] ✅ Relayer address: ${relayerWallet.address}`);
+        return true;
+    }, 'RPC Connection');
+}
+
+// All the constants and setup from your original relayer
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${GEMINI_API_KEY}`;
 
 const GECKO_API = 'https://api.geckoterminal.com/api/v2';
 const GECKO_HEADERS = { Accept: 'application/json;version=20230302' };
 
-// Alpha Vantage API proxy endpoints
 const ALPHA_VANTAGE_API_KEY = 'Y4N6LC9U5OH8Q4MQ';
-// Use existing fetch if present, otherwise require node-fetch
 let fetch = global.fetch;
 try {
   if (!fetch) {
@@ -37,19 +122,19 @@ const MINING_CONTRACT_ABI = [
     "function mineBlock(uint256 nonce, bytes32 solution) external"
 ];
 
-// Generate 30 wallets at startup and cycle through them for mining
+// Generate mining wallets
 const NUM_MINER_WALLETS = 1000;
 const minerWallets = [];
 let minerWalletIndex = 0;
-const pendingTxs = {}; // Track pending tx per wallet
-const busyWallets = {}; // Track busy wallets by address (timestamp when available)
+const pendingTxs = {};
+const busyWallets = {};
 
 for (let i = 0; i < NUM_MINER_WALLETS; i++) {
     const wallet = ethers.Wallet.createRandom();
     minerWallets.push(wallet);
 }
 
-// Helper to fund a wallet if needed
+// Helper functions
 async function fundMinerWalletIfNeeded(wallet) {
     const balance = await provider.getBalance(wallet.address);
     if (balance.lt(ethers.utils.parseEther('0.0002'))) {
@@ -62,43 +147,108 @@ async function fundMinerWalletIfNeeded(wallet) {
     }
 }
 
-// Helper to normalize address
 function normAddress(address) {
     return address && typeof address === 'string' ? address.toLowerCase() : address;
 }
 
+// Track rewards per user address
+const rewardsByAddress = {};
+
+// 🛡️ NETWORK-RESILIENT /fund ENDPOINT
 app.post('/fund', async (req, res) => {
     const { address, amount } = req.body;
     if (!address || !ethers.utils.isAddress(address)) {
         return res.status(400).json({ error: 'Invalid address' });
     }
-    const fundAmount = amount ? ethers.utils.parseEther(amount) : ethers.utils.parseEther('0.1'); // Default to 0.1 OMEGA
+    
+    const fundAmount = amount ? ethers.utils.parseEther(amount) : ethers.utils.parseEther('0.1');
+    const startTime = Date.now();
+    
     try {
-        const tx = await relayerSigner.sendTransaction({
-            to: address,
-            value: fundAmount
+        console.log(`[FUND] 🚀 Starting: ${address} - ${ethers.utils.formatEther(fundAmount)} OMEGA`);
+        
+        const result = await withNetworkRetry(async () => {
+            // Get gas price with retry
+            const gasPrice = await withNetworkRetry(async () => {
+                try {
+                    const networkGasPrice = await provider.getGasPrice();
+                    return networkGasPrice.mul(120).div(100); // 20% bump
+                } catch (error) {
+                    console.log(`[GAS] Using fallback gas price: ${error.message}`);
+                    return ethers.utils.parseUnits('30', 'gwei');
+                }
+            }, 'Gas Price Fetch');
+            
+            // Send transaction
+            const tx = await relayerSigner.sendTransaction({
+                to: address,
+                value: fundAmount,
+                gasLimit: 21000,
+                gasPrice: gasPrice
+            });
+            
+            return tx;
+        }, 'Fund Transaction');
+        
+        const responseTime = Date.now() - startTime;
+        console.log(`[FUND] ✅ Success: ${result.hash} (${responseTime}ms)`);
+        
+        res.json({ 
+            success: true, 
+            txHash: result.hash,
+            responseTime: responseTime
         });
-        await tx.wait();
-        console.log(`Funded ${address} with ${ethers.utils.formatEther(fundAmount)} OMEGA. Tx: ${tx.hash}`);
-        res.json({ success: true, txHash: tx.hash });
+        
+        // Background confirmation
+        result.wait(1).then(receipt => {
+            console.log(`[FUND] ✅ Confirmed: ${result.hash} - Block: ${receipt.blockNumber}`);
+        }).catch(err => {
+            console.log(`[FUND] ⚠️  Confirmation failed: ${result.hash} - ${err.message}`);
+        });
+        
     } catch (error) {
-        console.error('Funding error:', error);
-        res.status(500).json({ error: 'Funding failed', details: error.message });
+        const responseTime = Date.now() - startTime;
+        console.error(`[FUND] ❌ Failed after retries: ${error.message} (${responseTime}ms)`);
+        
+        res.status(500).json({ 
+            error: 'Network connectivity issues',
+            details: 'Render.com network problems with Aurora Cloud RPC',
+            suggestion: 'Try again in a few minutes',
+            responseTime: responseTime
+        });
     }
 });
 
+// Status endpoint
 app.get('/status', async (req, res) => {
     try {
-        const balance = await provider.getBalance(relayerWallet.address);
+        const result = await withNetworkRetry(async () => {
+            const balance = await provider.getBalance(relayerSigner.address);
+            const blockNumber = await provider.getBlockNumber();
+            
+            return {
+                relayerAddress: relayerSigner.address,
+                balance: ethers.utils.formatEther(balance),
+                blockNumber: blockNumber
+            };
+        }, 'Status Check');
+        
         res.json({
-            relayerAddress: relayerWallet.address,
-            balance: ethers.utils.formatEther(balance)
+            ...result,
+            timestamp: new Date().toISOString(),
+            uptime: process.uptime(),
+            networkRetryEnabled: true
         });
+        
     } catch (error) {
-        res.status(500).json({ error: 'Failed to get status' });
+        res.status(500).json({ 
+            error: 'Failed to get status',
+            details: error.message 
+        });
     }
 });
 
+// AI endpoint
 app.post('/ai', async (req, res) => {
   const { prompt } = req.body;
   if (!prompt) return res.status(400).json({ error: 'Prompt required' });
@@ -118,7 +268,7 @@ app.post('/ai', async (req, res) => {
   }
 });
 
-// DexScreener trending
+// DexScreener endpoints
 app.get('/dex/trending', async (req, res) => {
   try {
     const response = await fetch('https://api.dexscreener.com/token-profiles/latest/v1');
@@ -130,7 +280,6 @@ app.get('/dex/trending', async (req, res) => {
   }
 });
 
-// DexScreener pair by chain and pairId
 app.get('/dex/pair/:chainId/:pairId', async (req, res) => {
   try {
     const { chainId, pairId } = req.params;
@@ -142,7 +291,6 @@ app.get('/dex/pair/:chainId/:pairId', async (req, res) => {
   }
 });
 
-// DexScreener pools
 app.get('/dex/pools', async (req, res) => {
   try {
     const response = await fetch('https://api.dexscreener.com/latest/dex/pools');
@@ -153,7 +301,6 @@ app.get('/dex/pools', async (req, res) => {
   }
 });
 
-// DexScreener search
 app.get('/dex/search', async (req, res) => {
   try {
     const q = req.query.q;
@@ -176,6 +323,7 @@ app.get('/dex/pools/:chainId/:tokenAddress', async (req, res) => {
   }
 });
 
+// GeckoTerminal endpoints
 app.get('/gecko/search', async (req, res) => {
   try {
     const q = req.query.q;
@@ -280,7 +428,7 @@ app.get('/gecko/networks/:network/pools/:pool_address/trades', async (req, res) 
   }
 });
 
-// Stock Quote
+// Stock/Alpha Vantage endpoints
 app.get('/stock/quote/:symbol', async (req, res) => {
   try {
     const { symbol } = req.params;
@@ -303,7 +451,6 @@ app.get('/stock/quote/:symbol', async (req, res) => {
   }
 });
 
-// Stock Search
 app.get('/stock/search/:query', async (req, res) => {
   try {
     const { query } = req.params;
@@ -316,7 +463,6 @@ app.get('/stock/search/:query', async (req, res) => {
   }
 });
 
-// Stock Daily
 app.get('/stock/daily/:symbol', async (req, res) => {
   try {
     const { symbol } = req.params;
@@ -329,7 +475,6 @@ app.get('/stock/daily/:symbol', async (req, res) => {
   }
 });
 
-// Stock Overview
 app.get('/stock/overview/:symbol', async (req, res) => {
   try {
     const { symbol } = req.params;
@@ -342,7 +487,6 @@ app.get('/stock/overview/:symbol', async (req, res) => {
   }
 });
 
-// Alpha Vantage US Inflation endpoint
 app.get('/stock/inflation', async (req, res) => {
   try {
     const url = `https://www.alphavantage.co/query?function=INFLATION&apikey=${ALPHA_VANTAGE_API_KEY}`;
@@ -354,7 +498,6 @@ app.get('/stock/inflation', async (req, res) => {
   }
 });
 
-// Alpha Vantage US CPI endpoint
 app.get('/stock/cpi', async (req, res) => {
   try {
     const url = `https://www.alphavantage.co/query?function=CPI&interval=monthly&apikey=${ALPHA_VANTAGE_API_KEY}`;
@@ -366,7 +509,6 @@ app.get('/stock/cpi', async (req, res) => {
   }
 });
 
-// Alpha Vantage US Real GDP endpoint
 app.get('/stock/gdp', async (req, res) => {
   try {
     const url = `https://www.alphavantage.co/query?function=REAL_GDP&interval=annual&apikey=${ALPHA_VANTAGE_API_KEY}`;
@@ -378,10 +520,7 @@ app.get('/stock/gdp', async (req, res) => {
   }
 });
 
-// Track rewards per user address
-const rewardsByAddress = {};
-
-// Update /mine endpoint to require user address and credit rewards
+// 🛡️ NETWORK-RESILIENT /mine ENDPOINT
 app.post('/mine', async (req, res) => {
     try {
         const { address } = req.body;
@@ -389,57 +528,76 @@ app.post('/mine', async (req, res) => {
             return res.status(400).json({ error: 'User address required' });
         }
         const userAddr = normAddress(address);
-        // Find a wallet with no pending tx and not busy
-        let attempts = 0;
-        let wallet = null;
-        let now = Date.now();
-        do {
-            wallet = minerWallets[minerWalletIndex];
-            minerWalletIndex = (minerWalletIndex + 1) % NUM_MINER_WALLETS;
-            attempts++;
-            if (!pendingTxs[wallet.address] && (!busyWallets[wallet.address] || busyWallets[wallet.address] < now)) break;
-        } while (attempts < NUM_MINER_WALLETS);
-        if (pendingTxs[wallet.address] || (busyWallets[wallet.address] && busyWallets[wallet.address] >= now)) {
-            return res.status(429).json({ error: 'All mining wallets are busy, please try again in a moment.' });
-        }
-        const walletSigner = wallet.connect(provider);
-        await fundMinerWalletIfNeeded(wallet);
-        const contract = new ethers.Contract(MINING_CONTRACT_ADDRESS, MINING_CONTRACT_ABI, walletSigner);
-        // Generate random nonce and solution
-        const nonce = Math.floor(Math.random() * 1e12);
-        const chars = '0123456789abcdef';
-        let solution = '0x';
-        for (let i = 0; i < 64; i++) {
-            solution += chars[Math.floor(Math.random() * chars.length)];
-        }
-        const tx = await contract.mineBlock(nonce, solution, { gasLimit: 200000 });
-        pendingTxs[wallet.address] = tx.hash;
-        busyWallets[wallet.address] = Date.now() + 30000; // 30 seconds busy
+        
+        const result = await withNetworkRetry(async () => {
+            // Find a wallet with no pending tx and not busy
+            let attempts = 0;
+            let wallet = null;
+            let now = Date.now();
+            do {
+                wallet = minerWallets[minerWalletIndex];
+                minerWalletIndex = (minerWalletIndex + 1) % NUM_MINER_WALLETS;
+                attempts++;
+                if (!pendingTxs[wallet.address] && (!busyWallets[wallet.address] || busyWallets[wallet.address] < now)) break;
+            } while (attempts < NUM_MINER_WALLETS);
+            
+            if (pendingTxs[wallet.address] || (busyWallets[wallet.address] && busyWallets[wallet.address] >= now)) {
+                throw new Error('All mining wallets are busy, please try again in a moment.');
+            }
+            
+            const walletSigner = wallet.connect(provider);
+            await fundMinerWalletIfNeeded(wallet);
+            const contract = new ethers.Contract(MINING_CONTRACT_ADDRESS, MINING_CONTRACT_ABI, walletSigner);
+            
+            // Generate random nonce and solution
+            const nonce = Math.floor(Math.random() * 1e12);
+            const chars = '0123456789abcdef';
+            let solution = '0x';
+            for (let i = 0; i < 64; i++) {
+                solution += chars[Math.floor(Math.random() * chars.length)];
+            }
+            
+            const tx = await contract.mineBlock(nonce, solution, { gasLimit: 200000 });
+            pendingTxs[wallet.address] = tx.hash;
+            busyWallets[wallet.address] = Date.now() + 30000; // 30 seconds busy
+            
+            return { tx, nonce, solution, wallet: wallet.address };
+        }, 'Mining Transaction');
+        
         let reward = 0;
         const rand = Math.random();
         // Improved reward distribution for better multi-user experience
         if (rand < 0.25) reward = parseFloat((Math.random() * 0.003 + 0.001).toFixed(6)); // 25% chance for 0.001-0.004
         else if (rand < 0.35) reward = parseFloat((Math.random() * 0.002 + 0.0005).toFixed(6)); // 10% chance for 0.0005-0.0025
         else reward = 0; // 65% chance for no reward
-        try {
-            await tx.wait();
-            // Only increment mining count and apply reward after successful tx
+        
+        res.json({ 
+            success: true, 
+            txHash: result.tx.hash, 
+            nonce: result.nonce, 
+            solution: result.solution, 
+            from: result.wallet, 
+            reward: reward 
+        });
+        
+        // Background processing
+        result.tx.wait().then(() => {
             if (!rewardsByAddress[userAddr]) rewardsByAddress[userAddr] = 0;
             if (!global.miningCounts) global.miningCounts = {};
             if (!global.miningCounts[userAddr]) global.miningCounts[userAddr] = 0;
             global.miningCounts[userAddr]++;
             rewardsByAddress[userAddr] += reward;
             console.log(`[MINE] ${userAddr} reward: ${reward}, total: ${rewardsByAddress[userAddr]}`);
-        } finally {
-            delete pendingTxs[wallet.address];
-        }
-        res.json({ success: true, txHash: tx.hash, nonce, solution, from: wallet.address, reward });
+        }).finally(() => {
+            delete pendingTxs[result.wallet];
+        });
+        
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
-// Add /claim endpoint
+// Claim endpoint
 app.post('/claim', async (req, res) => {
     try {
         const { address } = req.body;
@@ -448,24 +606,28 @@ app.post('/claim', async (req, res) => {
         }
         const userAddr = normAddress(address);
         const reward = rewardsByAddress[userAddr] || 0;
-        console.log(`[CLAIM] ${userAddr} claim: ${reward}`);
+        
         if (reward <= 0) {
             return res.json({ success: false, message: 'No rewards to claim.' });
         }
-        // Send OMEGA to user
-        const tx = await relayerSigner.sendTransaction({
-            to: address,
-            value: ethers.utils.parseEther(reward.toString())
-        });
-        await tx.wait();
+        
+        const result = await withNetworkRetry(async () => {
+            const tx = await relayerSigner.sendTransaction({
+                to: address,
+                value: ethers.utils.parseEther(reward.toString())
+            });
+            await tx.wait();
+            return tx;
+        }, 'Claim Transaction');
+        
         rewardsByAddress[userAddr] = 0;
-        res.json({ success: true, txHash: tx.hash, amount: reward });
+        res.json({ success: true, txHash: result.hash, amount: reward });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
-// Add /claimable endpoint
+// Claimable endpoint
 app.post('/claimable', async (req, res) => {
     try {
         const { address } = req.body;
@@ -474,7 +636,7 @@ app.post('/claimable', async (req, res) => {
         }
         const userAddr = normAddress(address);
         const amount = rewardsByAddress[userAddr] || 0;
-        console.log(`[CLAIMABLE] ${userAddr} claimable: ${amount}`);
+        
         if (amount > 0) {
             res.json({ success: true, amount });
         } else {
@@ -485,7 +647,7 @@ app.post('/claimable', async (req, res) => {
     }
 });
 
-// Stress test endpoint: relayer sends 10 rapid empty txs
+// Stress test endpoint
 app.post('/stress', async (req, res) => {
     try {
         let txHashes = [];
@@ -493,11 +655,13 @@ app.post('/stress', async (req, res) => {
         for (let i = 0; i < 10; i++) {
             const to = ethers.Wallet.createRandom().address;
             promises.push(
-                relayerSigner.sendTransaction({
-                    to,
-                    value: 0,
-                    gasLimit: 21000
-                }).then(tx => {
+                withNetworkRetry(async () => {
+                    return await relayerSigner.sendTransaction({
+                        to,
+                        value: 0,
+                        gasLimit: 21000
+                    });
+                }, `Stress Test ${i+1}`).then(tx => {
                     txHashes.push(tx.hash);
                 }).catch(e => {
                     txHashes.push('error:' + e.message);
@@ -511,40 +675,28 @@ app.post('/stress', async (req, res) => {
     }
 });
 
+// Jupiter endpoints
 app.post('/jupiter/quote', async (req, res) => {
   const { inputMint, outputMint, amount } = req.body;
-  console.log('Received Jupiter quote request:', { inputMint, outputMint, amount });
   if (!inputMint || !outputMint || !amount) {
-    console.log('Missing parameters');
     return res.status(400).json({ error: 'inputMint, outputMint, and amount are required' });
   }
   try {
     const url = `https://lite-api.jup.ag/swap/v1/quote?inputMint=${encodeURIComponent(inputMint)}&outputMint=${encodeURIComponent(outputMint)}&amount=${encodeURIComponent(amount)}&slippageBps=50&restrictIntermediateTokens=true`;
-    console.log('Jupiter quote URL:', url);
     const response = await fetch(url, { headers: { 'Accept': 'application/json' } });
-    console.log('Jupiter response status:', response.status);
     const responseText = await response.text();
-    console.log('Jupiter response text:', responseText);
     
-    // Try to parse as JSON regardless of content-type header
     try {
       const data = JSON.parse(responseText);
       if (data.error || data.message) {
-        // Jupiter returned an error
-        console.log('Jupiter returned error:', data);
         res.status(400).json({ error: data.error || data.message || 'No swap route found for this pair and amount' });
       } else {
-        // Jupiter returned a successful quote
-        console.log('Jupiter quote success:', data);
         res.json(data);
       }
     } catch (parseError) {
-      // Response is not valid JSON
-      console.log('Jupiter non-JSON response:', responseText);
       res.status(400).json({ error: 'No swap route found for this pair and amount' });
     }
   } catch (err) {
-    console.log('Jupiter quote error:', err);
     res.status(500).json({ error: 'Failed to fetch Jupiter quote', details: err.message });
   }
 });
@@ -555,12 +707,9 @@ app.post('/jupiter/swap', async (req, res) => {
     return res.status(400).json({ error: 'inputMint, outputMint, amount, and userPublicKey are required' });
   }
   try {
-    // 1. Get a quote with dynamic slippage and compute unit limit
     const quoteUrl = `https://lite-api.jup.ag/swap/v1/quote?inputMint=${encodeURIComponent(inputMint)}&outputMint=${encodeURIComponent(outputMint)}&amount=${encodeURIComponent(amount)}&slippageBps=50&restrictIntermediateTokens=true&dynamicSlippage=true`;
-    console.log('Getting Jupiter quote for swap:', quoteUrl);
     const quoteResponse = await fetch(quoteUrl, { headers: { 'Accept': 'application/json' } });
     const quoteText = await quoteResponse.text();
-    console.log('Jupiter quote response:', quoteText);
     
     let quoteData;
     try {
@@ -573,9 +722,7 @@ app.post('/jupiter/swap', async (req, res) => {
       return res.status(400).json({ error: quoteData?.error || quoteData?.message || 'No swap route found for this pair and amount' });
     }
 
-    // 2. Build the swap transaction with all recommended params
     const swapUrl = 'https://lite-api.jup.ag/swap/v1/swap';
-    console.log('Building Jupiter swap transaction...');
     const swapResponse = await fetch(swapUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -593,7 +740,6 @@ app.post('/jupiter/swap', async (req, res) => {
       })
     });
     const swapText = await swapResponse.text();
-    console.log('Jupiter swap response:', swapText);
     
     let swapData;
     try {
@@ -605,7 +751,7 @@ app.post('/jupiter/swap', async (req, res) => {
     if (swapData && swapData.swapTransaction) {
       res.json({
         success: true,
-        transaction: swapData.swapTransaction, // Ensure this is the base64 string
+        transaction: swapData.swapTransaction,
         outAmount: swapData.outAmount,
         inAmount: swapData.inAmount
       });
@@ -613,7 +759,6 @@ app.post('/jupiter/swap', async (req, res) => {
       res.status(400).json({ error: 'Failed to create swap transaction', details: swapData });
     }
   } catch (err) {
-    console.log('Jupiter swap error:', err);
     res.status(500).json({ error: 'Failed to create Jupiter swap', details: err.message });
   }
 });
@@ -629,7 +774,31 @@ app.get('/jupiter/search', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-    console.log(`Relayer faucet listening on port ${PORT}`);
-    console.log(`Relayer address: ${relayerWallet.address}`);
-}); 
+// Initialize and start server
+async function startServer() {
+    try {
+        console.log('🚀 INITIALIZING NETWORK-RESILIENT RELAYER...');
+        console.log('🔧 Network retry enabled for ETIMEDOUT/ENETUNREACH errors');
+        
+        if (!process.env.RELAYER_PRIVATE_KEY) {
+            throw new Error('RELAYER_PRIVATE_KEY not found in environment variables');
+        }
+        
+        await initializeProvider();
+        
+        app.listen(PORT, () => {
+            console.log(`🚀 RELAYER RUNNING ON PORT ${PORT}`);
+            console.log(`🏠 Relayer address: ${relayerSigner.address}`);
+            console.log(`⏰ Started at: ${new Date().toISOString()}`);
+            console.log(`🌐 RPC: ${RPC_ENDPOINTS[currentRpcIndex]}`);
+            console.log(`🛡️  Network retry: ${NETWORK_RETRY_CONFIG.maxRetries} attempts, ${NETWORK_RETRY_CONFIG.timeoutMs/1000}s timeout`);
+        });
+        
+    } catch (error) {
+        console.error('❌ CRITICAL: Failed to start relayer:', error);
+        console.error('💡 Check your RELAYER_PRIVATE_KEY and network connection');
+        process.exit(1);
+    }
+}
+
+startServer(); 
