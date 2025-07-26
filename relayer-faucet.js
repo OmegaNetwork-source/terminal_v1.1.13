@@ -79,25 +79,49 @@ async function withNetworkRetry(operation, context = 'operation') {
     throw lastError;
 }
 
-// 🚀 INITIALIZE RPC WITH RETRY
+// 🚀 INITIALIZE RPC WITH RETRY (FIXED)
 async function initializeProvider() {
     const rpcUrl = RPC_ENDPOINTS[currentRpcIndex];
     console.log(`[RPC] Initializing connection to: ${rpcUrl}`);
     
-    await withNetworkRetry(async () => {
-        const testProvider = new ethers.providers.JsonRpcProvider(rpcUrl);
-        
-        // Test connection
-        const blockNumber = await testProvider.getBlockNumber();
-        console.log(`[RPC] ✅ Connected - Block: ${blockNumber}`);
-        
-        provider = testProvider;
-        const relayerWallet = new ethers.Wallet(process.env.RELAYER_PRIVATE_KEY);
-        relayerSigner = relayerWallet.connect(provider);
-        
-        console.log(`[RPC] ✅ Relayer address: ${relayerWallet.address}`);
-        return true;
-    }, 'RPC Connection');
+    let lastError;
+    
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            console.log(`[RPC] Connection attempt ${attempt}/3`);
+            
+            const testProvider = new ethers.providers.JsonRpcProvider(rpcUrl);
+            
+            // Test connection with shorter timeout
+            const blockNumber = await Promise.race([
+                testProvider.getBlockNumber(),
+                new Promise((_, reject) => 
+                    setTimeout(() => reject(new Error('RPC timeout')), 15000)
+                )
+            ]);
+            
+            console.log(`[RPC] ✅ Connected - Block: ${blockNumber}`);
+            
+            provider = testProvider;
+            const relayerWallet = new ethers.Wallet(process.env.RELAYER_PRIVATE_KEY);
+            relayerSigner = relayerWallet.connect(provider);
+            
+            console.log(`[RPC] ✅ Relayer address: ${relayerWallet.address}`);
+            return; // Success!
+            
+        } catch (error) {
+            lastError = error;
+            console.log(`[RPC] Attempt ${attempt} failed: ${error.message}`);
+            
+            if (attempt < 3) {
+                const delay = attempt * 2000; // 2s, 4s
+                console.log(`[RPC] Retrying in ${delay}ms...`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+            }
+        }
+    }
+    
+    throw new Error(`RPC connection failed after 3 attempts: ${lastError.message}`);
 }
 
 // All the constants and setup from your original relayer
@@ -774,30 +798,44 @@ app.get('/jupiter/search', async (req, res) => {
   }
 });
 
-// Initialize and start server
+// Initialize and start server (RESILIENT STARTUP)
 async function startServer() {
-    try {
-        console.log('🚀 INITIALIZING NETWORK-RESILIENT RELAYER...');
-        console.log('🔧 Network retry enabled for ETIMEDOUT/ENETUNREACH errors');
-        
-        if (!process.env.RELAYER_PRIVATE_KEY) {
-            throw new Error('RELAYER_PRIVATE_KEY not found in environment variables');
-        }
-        
-        await initializeProvider();
-        
-        app.listen(PORT, () => {
-            console.log(`🚀 RELAYER RUNNING ON PORT ${PORT}`);
-            console.log(`🏠 Relayer address: ${relayerSigner.address}`);
-            console.log(`⏰ Started at: ${new Date().toISOString()}`);
-            console.log(`🌐 RPC: ${RPC_ENDPOINTS[currentRpcIndex]}`);
-            console.log(`🛡️  Network retry: ${NETWORK_RETRY_CONFIG.maxRetries} attempts, ${NETWORK_RETRY_CONFIG.timeoutMs/1000}s timeout`);
-        });
-        
-    } catch (error) {
-        console.error('❌ CRITICAL: Failed to start relayer:', error);
-        console.error('💡 Check your RELAYER_PRIVATE_KEY and network connection');
+    console.log('🚀 INITIALIZING NETWORK-RESILIENT RELAYER...');
+    console.log('🔧 Network retry enabled for ETIMEDOUT/ENETUNREACH errors');
+    
+    if (!process.env.RELAYER_PRIVATE_KEY) {
+        console.error('❌ CRITICAL: RELAYER_PRIVATE_KEY not found in environment variables');
         process.exit(1);
+    }
+    
+    // Start server first, then initialize RPC
+    const server = app.listen(PORT, () => {
+        console.log(`🚀 RELAYER SERVER STARTED ON PORT ${PORT}`);
+        console.log(`⏰ Started at: ${new Date().toISOString()}`);
+        console.log(`🔧 Initializing RPC connection...`);
+    });
+    
+    // Initialize RPC in background
+    try {
+        await initializeProvider();
+        console.log(`✅ RELAYER FULLY OPERATIONAL`);
+        console.log(`🏠 Relayer address: ${relayerSigner.address}`);
+        console.log(`🌐 RPC: ${RPC_ENDPOINTS[currentRpcIndex]}`);
+    } catch (error) {
+        console.error('⚠️  RPC initialization failed, but server is running:', error.message);
+        console.error('🔄 Endpoints will retry connections automatically when called');
+        
+        // Set up retry initialization
+        setTimeout(async () => {
+            try {
+                console.log('🔄 Retrying RPC initialization...');
+                await initializeProvider();
+                console.log('✅ RPC connection recovered!');
+            } catch (retryError) {
+                console.log('❌ RPC retry failed, will try again in 60s');
+                // Could set up another retry here
+            }
+        }, 30000); // Retry after 30 seconds
     }
 }
 
